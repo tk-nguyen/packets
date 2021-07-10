@@ -10,8 +10,12 @@ use pnet::util::checksum;
 
 use trust_dns_resolver::{config::ResolverConfig, config::ResolverOpts, Resolver};
 
+use ctrlc::set_handler;
+
 use std::net::{IpAddr, Ipv4Addr};
-use std::rc::Rc;
+use std::process::exit;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -25,7 +29,7 @@ pub fn ping(query: String) {
 
     // Typical ICMP packet size
     let mut payload = [0u8; 64];
-    let input = Rc::new(query);
+    let input = Arc::new(query);
 
     // Iterate through received ping packets
     // If `ip` is not an IP address, try to resolve the domain name first
@@ -50,7 +54,10 @@ pub fn ping(query: String) {
     // Random identifier
     const IDENT_NUM: u16 = 111;
     const TTL: u8 = 64;
-    let mut counter: u16 = 1;
+    let counter = Arc::new(Mutex::new(0));
+    let packet_loss = Arc::new(Mutex::new(0));
+    let time: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::from(false));
 
     // Mimicking the `ping` utility in unix
     println!(
@@ -64,13 +71,42 @@ pub fn ping(query: String) {
         payload.len(),
         payload.len() - 8
     );
-    loop {
+
+    // Handle ctrl+c
+    let output = input.clone();
+    let time_out = time.clone();
+    let counter_out = counter.clone();
+    let packet_loss_out = packet_loss.clone();
+    let stop_out = stop.clone();
+    set_handler(move || {
+        stop_out.store(true, Ordering::SeqCst);
+        let time_out = time_out.lock().unwrap();
+        let counter_out = counter_out.lock().unwrap();
+        let packet_loss_out = packet_loss_out.lock().unwrap();
+        println!("-- {} ping statistics --", output);
+        println!(
+            "{} packets transmitted, {} packet received, {}% packet loss",
+            counter_out,
+            *counter_out - *packet_loss_out,
+            *packet_loss_out / *counter_out
+        );
+        println!(
+            "round-trip min/avg/max = {:.3}/{:.3}/{:.3} ms",
+            time_out[0],
+            time_out.iter().sum::<f64>() / time_out.len() as f64,
+            time_out[time_out.len() - 1]
+        );
+        exit(0);
+    })
+    .unwrap();
+
+    while !stop.load(Ordering::SeqCst) {
         let mut ping = MutableEchoRequestPacket::new(&mut payload).unwrap();
 
         ping.set_icmp_type(IcmpTypes::EchoRequest);
         ping.set_payload(b"hello");
         ping.set_identifier(IDENT_NUM);
-        ping.set_sequence_number(counter);
+        ping.set_sequence_number(*counter.lock().unwrap());
         ping.set_checksum(checksum(ping.packet(), 1));
 
         let curr_time = Instant::now();
@@ -82,11 +118,15 @@ pub fn ping(query: String) {
                 let pong = EchoReplyPacket::new(pkt.packet()).unwrap();
                 if pong.get_icmp_type() == IcmpTypes::EchoReply
                     && pong.get_identifier() == IDENT_NUM
-                    && pong.get_sequence_number() == counter
+                    && pong.get_sequence_number() == *counter.lock().unwrap()
                 {
                     let elapsed = curr_time.elapsed();
+                    *counter.lock().unwrap() += 1;
+                    time.lock()
+                        .unwrap()
+                        .push(elapsed.as_micros() as f64 / 1000 as f64);
                     println!(
-                        "{} bytes from {}: icmp_seq={} ttl={} time={} ms",
+                        "{} bytes from {}: icmp_seq={} ttl={} time={:.1} ms",
                         payload.len() - 8,
                         // Same as above
                         if input.to_string() == addr.to_string() {
@@ -94,19 +134,12 @@ pub fn ping(query: String) {
                         } else {
                             format!("{} ({})", input, addr)
                         },
-                        counter,
+                        counter.lock().unwrap(),
                         TTL,
-                        if elapsed.as_millis() == 0 {
-                            format!("0.{}", elapsed.as_micros())
-                        } else {
-                            format!(
-                                "{}.{:01}",
-                                elapsed.as_millis().to_string(),
-                                elapsed.as_micros()
-                            )
-                        }
+                        elapsed.as_micros() as f64 / 1000 as f64
                     );
-                    counter += 1;
+                } else {
+                    *packet_loss.lock().unwrap() += 1;
                 }
             }
             Err(e) => eprintln!("Error: {} ", e),
